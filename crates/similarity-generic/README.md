@@ -74,6 +74,9 @@ similarity-generic src/Main.java --language java --threshold 0.9
 
 # Show all functions in a file
 similarity-generic file.cpp --language cpp --show-functions
+
+# Compare across every file under directories (respects .gitignore)
+similarity-generic src/ lib/ --language csharp --min-lines 5
 ```
 
 ### Using Custom Language Configuration
@@ -252,10 +255,10 @@ similarity-generic main.go --language go
 
 # Example output:
 # Comparing functions for similarity...
-#   calculateSum <-> computeTotal: 92.50%
+#   calculateSum <-> computeTotal: 92.50% (main.go:10-20, main.go:30-40)
 
-# Analyze entire Go project
-find . -name "*.go" -exec similarity-generic {} --language go \;
+# Analyze entire Go project, including duplicates across files
+similarity-generic . --language go
 ```
 
 ### Complete Example

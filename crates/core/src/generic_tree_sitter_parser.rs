@@ -7,6 +7,9 @@ use std::error::Error;
 use std::rc::Rc;
 use tree_sitter::{Node, Parser};
 
+/// A function definition paired with the AST of its body.
+pub type FunctionWithTree = (GenericFunctionDef, Rc<TreeNode>);
+
 pub struct GenericTreeSitterParser {
     parser: Parser,
     config: GenericParserConfig,
@@ -64,10 +67,14 @@ impl GenericTreeSitterParser {
 
         let mut tree_node = TreeNode::new(label, value, current_id);
 
-        for child in node.children(&mut node.walk()) {
+        // Anonymous nodes are punctuation/keyword tokens; they dominate tree size and make
+        // unrelated functions look alike, so only named nodes are kept.
+        for child in node.named_children(&mut node.walk()) {
             let child_node = self.convert_node(child, source, id_counter);
             tree_node.add_child(Rc::new(child_node));
         }
+        // APTED asks for subtree sizes in its inner loops; cache them once here.
+        tree_node.subtree_size = Some(tree_node.get_subtree_size());
 
         tree_node
     }
@@ -78,6 +85,7 @@ impl GenericTreeSitterParser {
         source: &str,
         functions: &mut Vec<GenericFunctionDef>,
         class_name: Option<&str>,
+        trees: &mut Option<Vec<Rc<TreeNode>>>,
     ) {
         let node_kind = node.kind();
 
@@ -91,6 +99,15 @@ impl GenericTreeSitterParser {
         if self.config.function_nodes.contains(&node_kind.to_string()) {
             if let Some(func_def) = self.extract_function_definition(node, source, class_name) {
                 functions.push(func_def);
+                if let Some(trees) = trees {
+                    // Build the tree from the node in the full-file parse. Re-parsing a body
+                    // snippet on its own yields ERROR trees that all look alike.
+                    let body = node
+                        .child_by_field_name(&self.config.field_mappings.body_field)
+                        .unwrap_or(node);
+                    let mut id_counter = 0;
+                    trees.push(Rc::new(self.convert_node(body, source, &mut id_counter)));
+                }
             }
         }
 
@@ -104,14 +121,20 @@ impl GenericTreeSitterParser {
 
             // Recursively extract methods from class
             for child in node.children(&mut node.walk()) {
-                self.extract_functions_from_node(child, source, functions, Some(new_class_name));
+                self.extract_functions_from_node(
+                    child,
+                    source,
+                    functions,
+                    Some(new_class_name),
+                    trees,
+                );
             }
             return; // Don't continue normal traversal for type nodes
         }
 
         // Continue searching in children
         for child in node.children(&mut node.walk()) {
-            self.extract_functions_from_node(child, source, functions, class_name);
+            self.extract_functions_from_node(child, source, functions, class_name, trees);
         }
     }
 
@@ -364,6 +387,31 @@ impl GenericTreeSitterParser {
     }
 }
 
+impl GenericTreeSitterParser {
+    /// Extract functions together with the AST of each function body, taken from the
+    /// full-file parse.
+    pub fn extract_functions_with_trees(
+        &mut self,
+        source: &str,
+    ) -> Result<Vec<FunctionWithTree>, Box<dyn Error + Send + Sync>> {
+        let tree = self.parser.parse(source, None).ok_or_else(|| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "Failed to parse source"))
+                as Box<dyn Error + Send + Sync>
+        })?;
+
+        let mut functions = Vec::new();
+        let mut trees = Some(Vec::new());
+        self.extract_functions_from_node(
+            tree.root_node(),
+            source,
+            &mut functions,
+            None,
+            &mut trees,
+        );
+        Ok(functions.into_iter().zip(trees.unwrap_or_default()).collect())
+    }
+}
+
 impl LanguageParser for GenericTreeSitterParser {
     fn parse(
         &mut self,
@@ -392,7 +440,7 @@ impl LanguageParser for GenericTreeSitterParser {
 
         let root_node = tree.root_node();
         let mut functions = Vec::new();
-        self.extract_functions_from_node(root_node, source, &mut functions, None);
+        self.extract_functions_from_node(root_node, source, &mut functions, None, &mut None);
         Ok(functions)
     }
 

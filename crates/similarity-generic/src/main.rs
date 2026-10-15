@@ -1,12 +1,15 @@
 use anyhow::Result;
 use clap::Parser;
+use rayon::prelude::*;
+use similarity_core::apted::compute_edit_distance_with_cutoff_full_replace;
+use similarity_core::cli_file_utils::collect_files;
 use similarity_core::generic_parser_config::GenericParserConfig;
 use similarity_core::generic_tree_sitter_parser::GenericTreeSitterParser;
-use similarity_core::language_parser::LanguageParser;
-use similarity_core::tsed::{calculate_tsed, TSEDOptions};
+use similarity_core::tree::TreeNode;
 use similarity_core::APTEDOptions;
 use std::fs;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 // Include auto-generated language configs
 include!(concat!(env!("OUT_DIR"), "/language_configs.rs"));
@@ -15,9 +18,9 @@ include!(concat!(env!("OUT_DIR"), "/language_configs.rs"));
 #[command(name = "similarity-generic")]
 #[command(about = "Generic code similarity analyzer using tree-sitter")]
 struct Cli {
-    /// Path to analyze
+    /// Files or directories to analyze (directories are walked respecting .gitignore)
     #[arg(required_unless_present_any = ["supported", "show_config"])]
-    path: Option<PathBuf>,
+    paths: Vec<PathBuf>,
 
     /// Language configuration file (JSON)
     #[arg(short, long, conflicts_with_all = ["language", "supported", "show_config"])]
@@ -31,16 +34,24 @@ struct Cli {
     #[arg(short, long, default_value = "0.85")]
     threshold: f64,
 
+    /// Minimum lines for functions to be considered
+    #[arg(short, long, default_value = "3")]
+    min_lines: u32,
+
+    /// Rename cost for APTED algorithm
+    #[arg(short, long, default_value = "0.3")]
+    rename_cost: f64,
+
     /// Show extracted functions
     #[arg(long)]
     show_functions: bool,
 
     /// Show supported languages
-    #[arg(long, conflicts_with_all = ["path", "config", "language", "show_functions", "show_config"])]
+    #[arg(long, conflicts_with_all = ["paths", "config", "language", "show_functions", "show_config"])]
     supported: bool,
 
     /// Show example configuration for a language
-    #[arg(long, value_name = "LANGUAGE", conflicts_with_all = ["path", "config", "language", "show_functions", "supported"])]
+    #[arg(long, value_name = "LANGUAGE", conflicts_with_all = ["paths", "config", "language", "show_functions", "supported"])]
     show_config: Option<String>,
 
     /// Enable experimental overlap detection mode
@@ -103,7 +114,9 @@ fn main() -> Result<()> {
     }
 
     // Normal parsing mode
-    let path = cli.path.ok_or_else(|| anyhow::anyhow!("Path is required"))?;
+    if cli.paths.is_empty() {
+        return Err(anyhow::anyhow!("Path is required"));
+    }
 
     let config = if let Some(config_path) = &cli.config {
         GenericParserConfig::from_file(config_path)
@@ -159,7 +172,7 @@ fn main() -> Result<()> {
     };
 
     // Create parser based on language
-    let language = match config.language.as_str() {
+    let language: tree_sitter::Language = match config.language.as_str() {
         "go" => tree_sitter_go::LANGUAGE.into(),
         "java" => tree_sitter_java::LANGUAGE.into(),
         "c" => tree_sitter_c::LANGUAGE.into(),
@@ -169,100 +182,217 @@ fn main() -> Result<()> {
         _ => return Err(anyhow::anyhow!("Unsupported language: {}", config.language)),
     };
 
-    let mut parser = GenericTreeSitterParser::new(language, config.clone())
+    let mut parser = GenericTreeSitterParser::new(language.clone(), config.clone())
         .map_err(|e| anyhow::anyhow!("Failed to create parser: {}", e))?;
 
-    // Read file
-    let content = fs::read_to_string(&path)?;
-    let filename = path.to_string_lossy();
+    let extensions: &[&str] = match config.language.as_str() {
+        "go" => &["go"],
+        "java" => &["java"],
+        "c" => &["c", "h"],
+        "cpp" => &["cpp", "cc", "cxx", "hpp", "hxx", "h"],
+        "csharp" => &["cs"],
+        "ruby" => &["rb"],
+        _ => &[],
+    };
+    let path_strs: Vec<String> =
+        cli.paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+    let files = collect_files(&path_strs, extensions)?;
 
-    // Run appropriate analysis based on mode
     if cli.overlap {
-        // Overlap detection mode
-        check_overlaps(
-            path,
+        let path = files.first().ok_or_else(|| anyhow::anyhow!("No matching file found"))?;
+        return check_overlaps(
+            path.clone(),
             parser,
             cli.threshold,
             cli.overlap_min_window,
             cli.overlap_max_window,
             cli.overlap_size_tolerance,
-        )?;
-    } else {
-        // Normal similarity detection mode
-        // Extract functions
-        let functions = parser
-            .extract_functions(&content, &filename)
-            .map_err(|e| anyhow::anyhow!("Failed to extract functions: {}", e))?;
+        );
+    }
 
-        if cli.show_functions {
-            println!("Found {} functions:", functions.len());
-            for func in &functions {
-                println!("  {} {}:{}-{}", func.name, filename, func.start_line, func.end_line);
+    struct Func {
+        file: usize,
+        index: usize,
+        name: String,
+        start_line: u32,
+        end_line: u32,
+        size: usize,
+        labels: Vec<(usize, u32)>,
+    }
+
+    let contents: Vec<String> =
+        files.iter().map(fs::read_to_string).collect::<std::io::Result<_>>()?;
+    let mut label_ids: HashMap<String, usize> = HashMap::new();
+    let mut functions = Vec::new();
+    let mut listed = Vec::new();
+    for (file_idx, content) in contents.iter().enumerate() {
+        let filename = files[file_idx].to_string_lossy();
+        let extracted = parser
+            .extract_functions_with_trees(content)
+            .map_err(|e| anyhow::anyhow!("Failed to extract functions from {}: {}", filename, e))?;
+        for (index, (def, tree)) in extracted.into_iter().enumerate() {
+            if cli.show_functions {
+                listed.push(format!(
+                    "  {} {}:{}-{}",
+                    def.name, filename, def.start_line, def.end_line
+                ));
             }
-            println!();
-        }
-
-        // Compare functions
-        if functions.len() >= 2 {
-            println!("Comparing functions for similarity...");
-
-            let tsed_options = TSEDOptions {
-                apted_options: APTEDOptions {
-                    rename_cost: 0.3,
-                    delete_cost: 1.0,
-                    insert_cost: 1.0,
-                    compare_values: false,
-                },
-                min_lines: 1,
-                min_tokens: None,
-                size_penalty: false,
-                skip_test: false,
-            };
-
-            for i in 0..functions.len() {
-                for j in (i + 1)..functions.len() {
-                    let func1 = &functions[i];
-                    let func2 = &functions[j];
-
-                    // Extract function bodies
-                    let lines: Vec<&str> = content.lines().collect();
-                    let body1 =
-                        extract_function_body(&lines, func1.body_start_line, func1.body_end_line);
-                    let body2 =
-                        extract_function_body(&lines, func2.body_start_line, func2.body_end_line);
-
-                    // Parse and compare
-                    let tree1 =
-                        parser.parse(&body1, &format!("{}:{}", filename, func1.name)).map_err(
-                            |e| anyhow::anyhow!("Failed to parse function {}: {}", func1.name, e),
-                        )?;
-                    let tree2 =
-                        parser.parse(&body2, &format!("{}:{}", filename, func2.name)).map_err(
-                            |e| anyhow::anyhow!("Failed to parse function {}: {}", func2.name, e),
-                        )?;
-
-                    let similarity = calculate_tsed(&tree1, &tree2, &tsed_options);
-
-                    if similarity >= cli.threshold {
-                        println!("  {} <-> {}: {:.2}%", func1.name, func2.name, similarity * 100.0);
-                    }
-                }
+            if def.end_line - def.start_line + 1 < cli.min_lines {
+                continue;
             }
+            let mut counts: HashMap<usize, u32> = HashMap::new();
+            count_labels(&tree, &mut label_ids, &mut counts);
+            let mut labels: Vec<(usize, u32)> = counts.into_iter().collect();
+            labels.sort_unstable();
+            functions.push(Func {
+                file: file_idx,
+                index,
+                name: def.name,
+                start_line: def.start_line,
+                end_line: def.end_line,
+                size: tree.get_subtree_size(),
+                labels,
+            });
         }
+    }
+
+    if cli.show_functions {
+        println!("Found {} functions:", listed.len());
+        for line in &listed {
+            println!("{line}");
+        }
+        println!();
+    }
+
+    if functions.len() < 2 {
+        return Ok(());
+    }
+    println!("Comparing functions for similarity...");
+
+    let apted_options = APTEDOptions {
+        rename_cost: cli.rename_cost,
+        delete_cost: 1.0,
+        insert_cost: 1.0,
+        compare_values: true,
+    };
+
+    // Lower bound on the edit distance lets most pairs skip APTED: the size difference must be
+    // inserted/deleted, and every remaining unit of (label, value) histogram difference costs at
+    // least min(rename / 2, 1).
+    let per_label_unit = (cli.rename_cost / 2.0).min(1.0);
+    functions.sort_by_key(|f| f.size);
+    let candidates: Vec<(usize, usize)> = (0..functions.len())
+        .flat_map(|i| {
+            let functions = &functions;
+            ((i + 1)..functions.len())
+                .take_while(move |&j| {
+                    functions[i].size as f64 >= functions[j].size as f64 * cli.threshold
+                })
+                .filter(move |&j| {
+                    let (a, b) = (&functions[i], &functions[j]);
+                    let max_size = b.size as f64;
+                    let size_diff = (b.size - a.size) as f64;
+                    let l1 = label_l1(&a.labels, &b.labels) as f64;
+                    let lower = size_diff + (l1 - size_diff).max(0.0) * per_label_unit;
+                    1.0 - lower / max_size >= cli.threshold
+                })
+                .map(move |j| (i, j))
+        })
+        .collect();
+
+    // TreeNode uses Rc and cannot cross threads, so each worker re-extracts the trees once.
+    thread_local! {
+        static TREES: std::cell::RefCell<Option<Vec<Vec<Rc<TreeNode>>>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    let mut results: Vec<(f64, usize, usize)> = candidates
+        .into_par_iter()
+        .filter_map(|(i, j)| {
+            TREES.with(|cell| {
+                let mut cell = cell.borrow_mut();
+                let trees = cell.get_or_insert_with(|| {
+                    let mut parser = GenericTreeSitterParser::new(language.clone(), config.clone())
+                        .expect("parser was created once already");
+                    contents
+                        .iter()
+                        .map(|c| {
+                            parser
+                                .extract_functions_with_trees(c)
+                                .map(|v| v.into_iter().map(|(_, t)| t).collect())
+                                .unwrap_or_default()
+                        })
+                        .collect()
+                });
+                let (a, b) = (&functions[i], &functions[j]);
+                let (a, b) = (&trees[a.file][a.index], &trees[b.file][b.index]);
+                let max_size = a.get_subtree_size().max(b.get_subtree_size()) as f64;
+                let distance = compute_edit_distance_with_cutoff_full_replace(
+                    a,
+                    b,
+                    &apted_options,
+                    max_size * (1.0 - cli.threshold),
+                );
+                let similarity = 1.0 - distance / max_size;
+                (similarity >= cli.threshold).then_some((similarity, i, j))
+            })
+        })
+        .collect();
+
+    let score = |r: &(f64, usize, usize)| r.0 * (functions[r.1].size + functions[r.2].size) as f64;
+    results.sort_by(|x, y| score(y).partial_cmp(&score(x)).unwrap_or(std::cmp::Ordering::Equal));
+    for (similarity, i, j) in results {
+        let (a, b) = (&functions[i], &functions[j]);
+        println!(
+            "  {} <-> {}: {:.2}% ({}:{}-{}, {}:{}-{})",
+            a.name,
+            b.name,
+            similarity * 100.0,
+            files[a.file].display(),
+            a.start_line,
+            a.end_line,
+            files[b.file].display(),
+            b.start_line,
+            b.end_line
+        );
     }
 
     Ok(())
 }
 
-fn extract_function_body(lines: &[&str], start_line: u32, end_line: u32) -> String {
-    let start_idx = (start_line.saturating_sub(1)) as usize;
-    let end_idx = std::cmp::min(end_line as usize, lines.len());
-
-    if start_idx >= lines.len() {
-        return String::new();
+fn count_labels(
+    node: &TreeNode,
+    ids: &mut HashMap<String, usize>,
+    counts: &mut HashMap<usize, u32>,
+) {
+    let next = ids.len();
+    let id = *ids.entry(format!("{}\0{}", node.label, node.value)).or_insert(next);
+    *counts.entry(id).or_default() += 1;
+    for child in &node.children {
+        count_labels(child, ids, counts);
     }
+}
 
-    lines[start_idx..end_idx].join("\n")
+/// L1 distance between two sorted label histograms.
+fn label_l1(a: &[(usize, u32)], b: &[(usize, u32)]) -> u32 {
+    let (mut i, mut j, mut total) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].0.cmp(&b[j].0) {
+            std::cmp::Ordering::Less => {
+                total += a[i].1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                total += b[j].1;
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                total += a[i].1.abs_diff(b[j].1);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    total + a[i..].iter().map(|x| x.1).sum::<u32>() + b[j..].iter().map(|x| x.1).sum::<u32>()
 }
 
 fn check_overlaps(

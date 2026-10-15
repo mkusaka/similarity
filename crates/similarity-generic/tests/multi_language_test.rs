@@ -349,3 +349,64 @@ fn test_python_language_redirect() {
 
     cmd.assert().failure().stderr(predicate::str::contains("similarity-py"));
 }
+
+#[test]
+fn test_csharp_cross_file_directory() {
+    let dir = TempDir::new().unwrap();
+    create_test_file(
+        &dir,
+        "Orders.cs",
+        r#"
+public class Orders {
+    public int Total(List<Order> orders) {
+        var sum = 0;
+        foreach (var order in orders) {
+            if (order.Active) {
+                sum += order.Price * order.Count;
+            }
+        }
+        return sum;
+    }
+
+    public string Render(Customer customer) {
+        var builder = new StringBuilder();
+        builder.Append(customer.Name);
+        if (customer.Vip) {
+            builder.Append(" (VIP)");
+        } else {
+            builder.Append(customer.Email ?? "-");
+        }
+        return builder.ToString().Trim();
+    }
+}
+"#,
+    );
+    create_test_file(
+        &dir,
+        "Invoices.cs",
+        r#"
+public class Invoices {
+    public int Amount(List<Order> items) {
+        var sum = 0;
+        foreach (var item in items) {
+            if (item.Active) {
+                sum += item.Price * item.Count;
+            }
+        }
+        return sum;
+    }
+}
+"#,
+    );
+
+    let mut cmd = Command::cargo_bin("similarity-generic").unwrap();
+    cmd.arg(dir.path()).arg("--language").arg("csharp");
+
+    cmd.assert()
+        .success()
+        .stdout(
+            predicate::str::contains("Total <-> Amount")
+                .or(predicate::str::contains("Amount <-> Total")),
+        )
+        .stdout(predicate::str::contains("Render").not());
+}

@@ -1586,6 +1586,7 @@ dependencies = [
  "clap",
  "once_cell",
  "predicates",
+ "rayon",
  "serde",
  "serde_json",
  "similarity-core",

@@ -48,7 +48,22 @@ pub fn compute_edit_distance_with_cutoff(
     max_distance: f64,
 ) -> f64 {
     let mut memo: HashMap<(usize, usize), f64> = HashMap::new();
-    compute_edit_distance_cutoff(tree1, tree2, options, &mut memo, max_distance)
+    compute_edit_distance_cutoff(tree1, tree2, options, &mut memo, max_distance, false)
+}
+
+/// Same as [`compute_edit_distance_with_cutoff`], but replacing a subtree without mapping its
+/// root costs deleting it and inserting the other one. The variant above charges only the
+/// cheaper of the two, which keeps distances low enough that unrelated large functions with a
+/// homogeneous AST (e.g. C# call chains) score as near-duplicates.
+#[must_use]
+pub fn compute_edit_distance_with_cutoff_full_replace(
+    tree1: &Rc<TreeNode>,
+    tree2: &Rc<TreeNode>,
+    options: &APTEDOptions,
+    max_distance: f64,
+) -> f64 {
+    let mut memo: HashMap<(usize, usize), f64> = HashMap::new();
+    compute_edit_distance_cutoff(tree1, tree2, options, &mut memo, max_distance, true)
 }
 
 fn node_rename_cost(node1: &TreeNode, node2: &TreeNode, options: &APTEDOptions) -> f64 {
@@ -125,6 +140,7 @@ fn compute_edit_distance_cutoff(
     options: &APTEDOptions,
     memo: &mut HashMap<(usize, usize), f64>,
     max_distance: f64,
+    full_replace: bool,
 ) -> f64 {
     let key = (node1.id, node2.id);
 
@@ -153,7 +169,11 @@ fn compute_edit_distance_cutoff(
     // Calculate costs for delete-all and insert-all operations
     let delete_all_cost = options.delete_cost * size1;
     let insert_all_cost = options.insert_cost * size2;
-    let mut best = delete_all_cost.min(insert_all_cost);
+    let mut best = if full_replace {
+        delete_all_cost + insert_all_cost
+    } else {
+        delete_all_cost.min(insert_all_cost)
+    };
 
     // Try rename + optimal children alignment
     let rename_cost = node_rename_cost(node1, node2, options);
@@ -169,8 +189,14 @@ fn compute_edit_distance_cutoff(
 
         for child1 in &node1.children {
             for child2 in &node2.children {
-                let cost =
-                    compute_edit_distance_cutoff(child1, child2, options, memo, alignment_budget);
+                let cost = compute_edit_distance_cutoff(
+                    child1,
+                    child2,
+                    options,
+                    memo,
+                    alignment_budget,
+                    full_replace,
+                );
                 child_cost_matrix.insert((child1.id, child2.id), cost);
             }
         }
